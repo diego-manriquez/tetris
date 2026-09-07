@@ -1,0 +1,123 @@
+name: Claude Issue Triage
+
+on:
+  issues:
+    types: [opened, edited]
+
+concurrency:
+  group: issue-triage-${{ github.event.issue.number }}
+  cancel-in-progress: true
+
+jobs:
+  triage:
+    if: github.event.sender.type != 'Bot'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+      id-token: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Ensure triage labels exist
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          ensure_label () {
+            gh label create "$1" --color "$2" --description "$3" --force
+          }
+          ensure_label "area:gameplay"   "1D76DB" "Game rules: collisions, rotation, spawn, locking"
+          ensure_label "area:rendering"  "1D76DB" "Canvas rendering: board, ghost piece, next preview"
+          ensure_label "area:input"      "1D76DB" "Keyboard input handling"
+          ensure_label "area:ui"         "1D76DB" "HUD, overlays, index.html / style.css"
+          ensure_label "area:scoring"    "1D76DB" "Score, lines, level, speed"
+          ensure_label "area:performance" "1D76DB" "Game loop / requestAnimationFrame timing"
+          ensure_label "needs-info"      "FBCA04" "More information is needed to proceed"
+          ensure_label "needs-triage"    "FBCA04" "Could not be classified with confidence"
+          ensure_label "priority:high"   "B60205" "High priority"
+          ensure_label "priority:medium" "D93F0B" "Medium priority"
+          ensure_label "priority:low"    "0E8A16" "Low priority"
+
+      - name: Run Claude issue triage
+        id: claude-triage
+        uses: anthropics/claude-code-action@v1
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          claude_args: '--allowedTools "Read,Grep,Glob,Bash(gh issue view:*),Bash(gh issue edit:*),Bash(gh issue comment:*),Bash(gh label list:*),Bash(gh search issues:*)"'
+          prompt: |
+            You are triaging GitHub issue #${{ github.event.issue.number }} in ${{ github.repository }},
+            a vanilla JavaScript Tetris game (HTML5 Canvas + CSS, no build step, no tests, no dependencies).
+
+            Repository context: read `CLAUDE.md` at the repo root first — it documents the full
+            architecture (board model, `PIECES`, `collide()`, the `loop()` game loop, `lockPiece()`,
+            scoring, `draw()`/`drawNext()`, input handling). Then inspect `game.js`, `index.html`, and
+            `style.css` with Read/Grep as needed. Never invent function names or line numbers — verify
+            everything you cite against the actual files.
+
+            Steps:
+
+            1. Fetch the issue: `gh issue view ${{ github.event.issue.number }} --json title,body,author,labels,comments`.
+            2. Read CLAUDE.md and the source files relevant to the issue's description.
+            3. Check for likely duplicates: `gh search issues --repo ${{ github.repository }} "<keywords>"`.
+               If you find a clear duplicate, mention it in the comment and consider the `duplicate` label.
+            4. List available labels with `gh label list` and choose ONLY from that list. Composition rules:
+               - Exactly one type label: `bug`, `enhancement`, `documentation`, or `question`.
+               - One or more `area:*` labels that actually match the affected code.
+               - Exactly one `priority:*` label, justified in one line.
+               - Add `needs-info` if key reproduction details are missing.
+               - If you cannot classify with reasonable confidence, apply `needs-triage` instead of guessing.
+               Apply labels with `gh issue edit ${{ github.event.issue.number }} --add-label "..."`.
+               Only ADD labels — never remove labels that are already present (a human may have set them).
+            5. Post the diagnosis as a single "sticky" comment in English, so repeated issue edits update
+               the same comment instead of piling up new ones. First check for an existing sticky comment:
+               `gh issue view ${{ github.event.issue.number }} --json comments --jq '.comments[] | select(.body | contains("<!-- claude-issue-triage -->")) | .id'`.
+               - If one exists, edit it in place: `gh api repos/${{ github.repository }}/issues/comments/<id> -X PATCH -f body=@<file>`.
+               - If none exists, create it: `gh issue comment ${{ github.event.issue.number }} --body-file <file>`.
+               The comment body MUST start with the exact marker line `<!-- claude-issue-triage -->` and follow
+               this template:
+
+               ## 🤖 Claude triage
+
+               **Type:** bug / enhancement / question / documentation
+               **Areas:** area:... (comma separated)
+               **Priority:** high|medium|low — one-line justification
+
+               ### Summary
+               Restate the problem in one or two sentences.
+
+               ### Suspected code
+               - `game.js:NNN` — `functionName()` — why it is implicated (omit if not applicable, e.g. pure docs/question issues)
+
+               ### Likely root cause
+               Best-effort technical explanation grounded in the actual code you read.
+
+               ### Proposed fix
+               A concrete implementation approach in terms of existing functions/patterns (e.g. "extend the
+               wall-kick offsets tested in `tryRotate`"). Do not write the actual code patch — this is a plan
+               for a human to implement next.
+
+               ### Risks / side effects
+               Interactions with collision detection, the drop loop, scoring, rendering, etc.
+
+               ### How to verify
+               Concrete manual steps to check in the browser (this repo has no test tooling — verification is
+               done by reloading index.html).
+
+               ### Missing information
+               Only include this section if you applied `needs-info`; list exactly what's needed to proceed.
+
+               ---
+               <sub>Automated analysis by Claude — may be incomplete or wrong. Re-runs on every issue edit.</sub>
+
+            Constraints:
+            - Do NOT modify any file in the repository.
+            - Do NOT open a pull request or branch.
+            - Do NOT edit the issue's title or body (that would re-trigger this workflow in a loop).
+            - Only use `gh issue edit` to add labels, and `gh issue comment` / `gh api ... issues/comments` to
+              post or update the single sticky comment described above.
