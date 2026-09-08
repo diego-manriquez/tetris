@@ -267,6 +267,7 @@ function loop(ts) {
     }
   }
   draw();
+  if (paused || gameOver) return;
   animId = requestAnimationFrame(loop);
 }
 
