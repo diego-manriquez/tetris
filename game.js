@@ -4,6 +4,12 @@ const COLS = 10;
 const ROWS = 20;
 const BLOCK = 30;
 
+// Cell sentinel: a nut's hollow center. Painted like a block but not solid,
+// so collision, merge and line-clear all treat it as "not filled".
+const HOLE = -1;
+const NUT_TYPE = 8;
+const NUT_CHANCE = 0.1; // probability that a spawned piece is the nut
+
 const COLORS = [
   null,
   '#4dd0e1', // I - cyan
@@ -13,6 +19,7 @@ const COLORS = [
   '#e57373', // Z - red
   '#90caf9', // J - pale blue
   '#ffb74d', // L - orange
+  '#b0bec5', // nut - metallic grey
 ];
 
 const PIECES = [
@@ -24,6 +31,7 @@ const PIECES = [
   [[5,5,0],[0,5,5],[0,0,0]],                  // Z
   [[6,0,0],[6,6,6],[0,0,0]],                  // J
   [[0,0,7],[7,7,7],[0,0,0]],                  // L
+  [[8,8,8],[8,HOLE,8],[8,8,8]],               // nut - 3x3 with a hollow center
 ];
 
 const LINE_SCORES = [0, 100, 300, 500, 800];
@@ -42,13 +50,15 @@ const restartBtn = document.getElementById('restart-btn');
 const themeToggleBtn = document.getElementById('theme-toggle');
 
 let board, current, next, score, lines, level, paused, gameOver, lastTime, dropAccum, dropInterval, animId;
-let gridColor;
+let gridColor, holeColor;
 
 function applyTheme(theme) {
   document.documentElement.setAttribute('data-theme', theme);
   localStorage.setItem('theme', theme);
   themeToggleBtn.textContent = theme === 'dark' ? '🌙' : '☀️';
-  gridColor = getComputedStyle(document.documentElement).getPropertyValue('--grid-line').trim();
+  const rootStyle = getComputedStyle(document.documentElement);
+  gridColor = rootStyle.getPropertyValue('--grid-line').trim();
+  holeColor = rootStyle.getPropertyValue('--panel-bg').trim();
 }
 
 function toggleTheme() {
@@ -61,7 +71,7 @@ function createBoard() {
 }
 
 function randomPiece() {
-  const type = Math.floor(Math.random() * 7) + 1;
+  const type = Math.random() < NUT_CHANCE ? NUT_TYPE : Math.floor(Math.random() * 7) + 1;
   const shape = PIECES[type].map(row => [...row]);
   return { type, shape, x: Math.floor(COLS / 2) - Math.floor(shape[0].length / 2), y: 0 };
 }
@@ -69,11 +79,11 @@ function randomPiece() {
 function collide(shape, ox, oy) {
   for (let r = 0; r < shape.length; r++) {
     for (let c = 0; c < shape[r].length; c++) {
-      if (!shape[r][c]) continue;
+      if (shape[r][c] <= 0) continue; // empty cells and nut holes don't collide
       const nx = ox + c;
       const ny = oy + r;
       if (nx < 0 || nx >= COLS || ny >= ROWS) return true;
-      if (ny >= 0 && board[ny][nx]) return true;
+      if (ny >= 0 && board[ny][nx] > 0) return true;
     }
   }
   return false;
@@ -101,16 +111,23 @@ function tryRotate() {
 }
 
 function merge() {
-  for (let r = 0; r < current.shape.length; r++)
-    for (let c = 0; c < current.shape[r].length; c++)
-      if (current.shape[r][c])
-        board[current.y + r][current.x + c] = current.shape[r][c];
+  for (let r = 0; r < current.shape.length; r++) {
+    for (let c = 0; c < current.shape[r].length; c++) {
+      const v = current.shape[r][c];
+      if (v > 0) {
+        board[current.y + r][current.x + c] = v;
+      } else if (v === HOLE && board[current.y + r][current.x + c] === 0) {
+        // only stamp the hole onto an empty cell — never erase a block under it
+        board[current.y + r][current.x + c] = HOLE;
+      }
+    }
+  }
 }
 
 function clearLines() {
   let cleared = 0;
   for (let r = ROWS - 1; r >= 0; r--) {
-    if (board[r].every(v => v !== 0)) {
+    if (board[r].every(v => v > 0)) { // a nut hole (HOLE) keeps the row from clearing
       board.splice(r, 1);
       board.unshift(new Array(COLS).fill(0));
       cleared++;
@@ -171,7 +188,7 @@ function updateHUD() {
 }
 
 function drawBlock(context, x, y, colorIndex, size, alpha) {
-  if (!colorIndex) return;
+  if (colorIndex <= 0) return; // skip empty cells and nut holes
   const color = COLORS[colorIndex];
   context.globalAlpha = alpha ?? 1;
   context.fillStyle = color;
@@ -180,6 +197,26 @@ function drawBlock(context, x, y, colorIndex, size, alpha) {
   context.fillStyle = 'rgba(255,255,255,0.12)';
   context.fillRect(x * size + 1, y * size + 1, size - 2, 4);
   context.globalAlpha = 1;
+}
+
+// A nut hole: paint the full cell like a nut block, then punch a round
+// hole in it using the board background so it reads as a real gap.
+function drawHole(context, x, y, size, alpha) {
+  context.globalAlpha = alpha ?? 1;
+  context.fillStyle = COLORS[NUT_TYPE];
+  context.fillRect(x * size + 1, y * size + 1, size - 2, size - 2);
+  context.fillStyle = 'rgba(255,255,255,0.12)';
+  context.fillRect(x * size + 1, y * size + 1, size - 2, 4);
+  context.fillStyle = holeColor;
+  context.beginPath();
+  context.arc(x * size + size / 2, y * size + size / 2, size * 0.3, 0, Math.PI * 2);
+  context.fill();
+  context.globalAlpha = 1;
+}
+
+function drawCell(context, x, y, value, size, alpha) {
+  if (value === HOLE) drawHole(context, x, y, size, alpha);
+  else drawBlock(context, x, y, value, size, alpha);
 }
 
 function drawGrid() {
@@ -206,19 +243,19 @@ function draw() {
   // board
   for (let r = 0; r < ROWS; r++)
     for (let c = 0; c < COLS; c++)
-      drawBlock(ctx, c, r, board[r][c], BLOCK);
+      drawCell(ctx, c, r, board[r][c], BLOCK);
 
   // ghost
   const gy = ghostY();
   for (let r = 0; r < current.shape.length; r++)
     for (let c = 0; c < current.shape[r].length; c++)
       if (current.shape[r][c])
-        drawBlock(ctx, current.x + c, gy + r, current.shape[r][c], BLOCK, 0.2);
+        drawCell(ctx, current.x + c, gy + r, current.shape[r][c], BLOCK, 0.2);
 
   // current piece
   for (let r = 0; r < current.shape.length; r++)
     for (let c = 0; c < current.shape[r].length; c++)
-      drawBlock(ctx, current.x + c, current.y + r, current.shape[r][c], BLOCK);
+      drawCell(ctx, current.x + c, current.y + r, current.shape[r][c], BLOCK);
 }
 
 function drawNext() {
@@ -229,7 +266,7 @@ function drawNext() {
   const offY = Math.floor((4 - shape.length) / 2);
   for (let r = 0; r < shape.length; r++)
     for (let c = 0; c < shape[r].length; c++)
-      drawBlock(nextCtx, offX + c, offY + r, shape[r][c], NB);
+      drawCell(nextCtx, offX + c, offY + r, shape[r][c], NB);
 }
 
 function endGame() {
